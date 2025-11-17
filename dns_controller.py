@@ -1,0 +1,611 @@
+import subprocess
+import os
+import platform
+import socket
+import requests
+import threading
+import time
+import sys
+from urllib.parse import urlparse
+import colorama
+from colorama import Fore, Back, Style
+import signal
+import atexit
+import statistics
+import json
+from datetime import datetime
+
+# Initialize colorama
+colorama.init(autoreset=True)
+
+class DNSController:
+    def __init__(self):
+        self.system = platform.system().lower()
+        self.original_dns = self.get_current_dns()
+        self.is_admin = self.check_admin_privileges()
+        self.current_dns = None
+        self.is_running = True
+        self.last_dns_state = self.original_dns
+        self.monitoring_thread = None
+        self.performance_results = {}
+        
+        # Register cleanup function to restore original DNS on exit
+        atexit.register(self.cleanup)
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+        
+    def signal_handler(self, signum, frame):
+        """Handle system signals to restore DNS before exiting"""
+        print(f"\n{Fore.YELLOW}⚠️  Received signal {signum}, restoring original DNS settings...{Style.RESET_ALL}")
+        self.cleanup()
+        sys.exit(0)
+    
+    def cleanup(self):
+        """Restore original DNS settings"""
+        if self.original_dns and self.current_dns:
+            print(f"\n{Fore.BLUE}🔄 Restoring original DNS settings...{Style.RESET_ALL}")
+            self.reset_dns()
+            self.is_running = False
+        if self.monitoring_thread and self.monitoring_thread.is_alive():
+            self.monitoring_thread.join(timeout=1)
+
+    def check_admin_privileges(self):
+        """Check if script is running with admin/root privileges"""
+        try:
+            if self.system == "windows":
+                import ctypes
+                return ctypes.windll.shell32.IsUserAnAdmin()
+            else:
+                return os.geteuid() == 0
+        except:
+            return False
+
+    def get_current_dns(self):
+        """Get current DNS settings"""
+        try:
+            if self.system == "windows":
+                result = subprocess.run(["ipconfig", "/all"], capture_output=True, text=True)
+                return result.stdout
+            elif self.system in ["linux", "darwin"]:
+                if os.path.exists("/etc/resolv.conf"):
+                    with open("/etc/resolv.conf", "r") as f:
+                        return f.read()
+                else:
+                    result = subprocess.run(["systemd-resolve", "--status"], capture_output=True, text=True)
+                    return result.stdout
+        except Exception as e:
+            print(f"{Fore.RED}❌ Error getting current DNS: {e}{Style.RESET_ALL}")
+            return None
+
+    def change_dns_windows(self, dns_servers):
+        """Change DNS settings on Windows"""
+        if not self.is_admin:
+            print(f"{Fore.RED}🔐 Administrator privileges required for Windows DNS change{Style.RESET_ALL}")
+            return False
+            
+        try:
+            # Get network adapter name
+            result = subprocess.run(["netsh", "interface", "show", "interface"], capture_output=True, text=True)
+            adapters = result.stdout.split('\n')
+            adapter_name = None
+            
+            for line in adapters:
+                if "Connected" in line:
+                    parts = line.split()
+                    if len(parts) > 3:
+                        adapter_name = ' '.join(parts[3:])
+                        break
+            
+            if not adapter_name:
+                print(f"{Fore.RED}❌ No connected network adapter found{Style.RESET_ALL}")
+                return False
+            
+            # Set new DNS servers
+            subprocess.run(["netsh", "interface", "ip", "set", "dns", f"name={adapter_name}", "static", dns_servers[0]], check=True)
+            subprocess.run(["netsh", "interface", "ip", "add", "dns", f"name={adapter_name}", dns_servers[1], "index=2"], check=True)
+            self.current_dns = dns_servers
+            print(f"{Fore.GREEN}✅ DNS changed successfully on Windows for {adapter_name}{Style.RESET_ALL}")
+            return True
+        except Exception as e:
+            print(f"{Fore.RED}❌ Error changing DNS on Windows: {e}{Style.RESET_ALL}")
+            return False
+
+    def change_dns_linux(self, dns_servers):
+        """Change DNS settings on Linux"""
+        if not self.is_admin:
+            print(f"{Fore.RED}🔐 Root privileges required for Linux DNS change{Style.RESET_ALL}")
+            return False
+            
+        try:
+            # Backup original file
+            if os.path.exists("/etc/resolv.conf"):
+                subprocess.run(["cp", "/etc/resolv.conf", "/etc/resolv.conf.backup"], check=True)
+            
+            # Write new DNS settings
+            with open("/etc/resolv.conf", "w") as f:
+                f.write("# Generated by DNSController script\n")
+                for i, dns in enumerate(dns_servers):
+                    f.write(f"nameserver {dns}\n")
+            
+            # Restart network manager if available
+            try:
+                subprocess.run(["systemctl", "restart", "NetworkManager"], check=False)
+            except:
+                pass  # Continue even if systemctl fails
+            
+            self.current_dns = dns_servers
+            print(f"{Fore.GREEN}✅ DNS changed successfully on Linux{Style.RESET_ALL}")
+            return True
+        except Exception as e:
+            print(f"{Fore.RED}❌ Error changing DNS on Linux: {e}{Style.RESET_ALL}")
+            return False
+
+    def change_dns_darwin(self, dns_servers):
+        """Change DNS settings on macOS"""
+        if not self.is_admin:
+            print(f"{Fore.RED}🔐 Root privileges required for macOS DNS change{Style.RESET_ALL}")
+            return False
+            
+        try:
+            # Get network service
+            result = subprocess.run(["networksetup", "-listallnetworkservices"], capture_output=True, text=True)
+            services = result.stdout.strip().split('\n')[1:]  # Skip header
+            primary_service = services[0] if services else None
+            
+            if not primary_service or primary_service.startswith("*"):
+                print(f"{Fore.RED}❌ No active network service found{Style.RESET_ALL}")
+                return False
+            
+            # Set new DNS
+            subprocess.run(["networksetup", "-setdnsservers", primary_service] + dns_servers, check=True)
+            self.current_dns = dns_servers
+            print(f"{Fore.GREEN}✅ DNS changed successfully on macOS for {primary_service}{Style.RESET_ALL}")
+            return True
+        except Exception as e:
+            print(f"{Fore.RED}❌ Error changing DNS on macOS: {e}{Style.RESET_ALL}")
+            return False
+
+    def change_dns(self, dns_servers):
+        """Main method to change DNS based on OS"""
+        if not isinstance(dns_servers, list) or len(dns_servers) < 2:
+            print(f"{Fore.RED}⚠️  Provide at least 2 DNS servers{Style.RESET_ALL}")
+            return False
+            
+        if self.system == "windows":
+            return self.change_dns_windows(dns_servers)
+        elif self.system == "linux":
+            return self.change_dns_linux(dns_servers)
+        elif self.system == "darwin":
+            return self.change_dns_darwin(dns_servers)
+        else:
+            print(f"{Fore.RED}❌ Unsupported system: {self.system}{Style.RESET_ALL}")
+            return False
+
+    def reset_dns(self):
+        """Reset DNS to original settings"""
+        if self.system == "linux" and os.path.exists("/etc/resolv.conf.backup"):
+            subprocess.run(["cp", "/etc/resolv.conf.backup", "/etc/resolv.conf"], check=True)
+            print(f"{Fore.GREEN}🔄 DNS settings restored from backup{Style.RESET_ALL}")
+        elif self.system == "windows":
+            # Reset to DHCP
+            try:
+                result = subprocess.run(["netsh", "interface", "show", "interface"], capture_output=True, text=True)
+                adapters = result.stdout.split('\n')
+                adapter_name = None
+                
+                for line in adapters:
+                    if "Connected" in line:
+                        parts = line.split()
+                        if len(parts) > 3:
+                            adapter_name = ' '.join(parts[3:])
+                            break
+                
+                if adapter_name:
+                    subprocess.run(["netsh", "interface", "ip", "set", "dns", f"name={adapter_name}", "dhcp"], check=True)
+                    print(f"{Fore.GREEN}🔄 Windows DNS reset to DHCP{Style.RESET_ALL}")
+            except Exception as e:
+                print(f"{Fore.RED}❌ Error resetting Windows DNS: {e}{Style.RESET_ALL}")
+        elif self.system == "darwin":
+            try:
+                result = subprocess.run(["networksetup", "-listallnetworkservices"], capture_output=True, text=True)
+                services = result.stdout.strip().split('\n')[1:]
+                primary_service = services[0] if services else None
+                
+                if primary_service:
+                    subprocess.run(["networksetup", "-setdnsservers", primary_service, "empty"], check=True)
+                    print(f"{Fore.GREEN}🔄 macOS DNS reset to default{Style.RESET_ALL}")
+            except Exception as e:
+                print(f"{Fore.RED}❌ Error resetting macOS DNS: {e}{Style.RESET_ALL}")
+        
+        self.current_dns = None
+
+    def test_dns_resolution(self, hostname="www.google.com"):
+        """Test if DNS resolution is working"""
+        try:
+            ip = socket.gethostbyname(hostname)
+            print(f"{Fore.GREEN}✅ DNS resolution test passed: {hostname} -> {ip}{Style.RESET_ALL}")
+            return True
+        except Exception as e:
+            print(f"{Fore.RED}❌ DNS resolution test failed: {e}{Style.RESET_ALL}")
+            return False
+
+    def test_internet_access(self, url="https://httpbin.org/ip"):
+        """Test internet access"""
+        try:
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                print(f"{Fore.GREEN}🌐 Internet access test passed{Style.RESET_ALL}")
+                return True
+        except Exception as e:
+            print(f"{Fore.RED}❌ Internet access test failed: {e}{Style.RESET_ALL}")
+        return False
+
+    def flush_dns_cache(self):
+        """Flush DNS cache"""
+        try:
+            if self.system == "windows":
+                subprocess.run(["ipconfig", "/flushdns"], check=True)
+            elif self.system == "linux":
+                subprocess.run(["sudo", "systemd-resolve", "--flush-caches"], check=True)
+                subprocess.run(["sudo", "service", "networking", "restart"], check=True)
+            elif self.system == "darwin":
+                subprocess.run(["sudo", "dscacheutil", "-flushcache"], check=True)
+                subprocess.run(["sudo", "killall", "-HUP", "mDNSResponder"], check=True)
+            print(f"{Fore.GREEN}🧹 DNS cache flushed successfully{Style.RESET_ALL}")
+        except Exception as e:
+            print(f"{Fore.RED}❌ Error flushing DNS cache: {e}{Style.RESET_ALL}")
+
+    def show_status(self):
+        """Show current DNS status"""
+        print(f"\n{Fore.CYAN}📊 Current Status:{Style.RESET_ALL}")
+        print(f"{Fore.BLUE}Operating System: {Fore.YELLOW}{self.system}{Style.RESET_ALL}")
+        print(f"{Fore.BLUE}Admin Privileges: {Fore.GREEN if self.is_admin else Fore.RED}{self.is_admin}{Style.RESET_ALL}")
+        print(f"{Fore.BLUE}Current DNS: {Fore.GREEN if self.current_dns else Fore.RED}{self.current_dns or 'Default/Original'}{Style.RESET_ALL}")
+        print(f"{Fore.BLUE}Original DNS: {Fore.YELLOW}Backed up{Style.RESET_ALL}")
+
+    # NEW: Advanced DNS Testing & Monitoring
+    def advanced_dns_test(self, test_sites=None):
+        """Perform comprehensive DNS testing"""
+        if test_sites is None:
+            test_sites = [
+                "www.google.com",
+                "www.youtube.com", 
+                "www.wikipedia.org",
+                "www.github.com",
+                "www.stackoverflow.com",
+                "www.telegram.org",
+                "www.whatsapp.com",
+                "www.discord.com",
+                "www.twitch.tv",
+                "www.netflix.com"
+            ]
+        
+        results = {}
+        print(f"{Fore.BLUE}🔍 Performing advanced DNS testing on {len(test_sites)} sites...{Style.RESET_ALL}")
+        
+        for site in test_sites:
+            try:
+                ip = socket.gethostbyname(site)
+                latency = self.measure_latency(ip)
+                results[site] = {"ip": ip, "status": "success", "latency": latency}
+            except Exception as e:
+                results[site] = {"status": "failed", "error": str(e)}
+        
+        # Display results
+        success_count = sum(1 for data in results.values() if data["status"] == "success")
+        print(f"\n{Fore.CYAN}📊 Test Results: {success_count}/{len(test_sites)} successful{Style.RESET_ALL}")
+        
+        for site, data in results.items():
+            if data["status"] == "success":
+                print(f"{Fore.GREEN}✅ {site}: {data['ip']} (Latency: {data['latency']:.2f}ms){Style.RESET_ALL}")
+            else:
+                print(f"{Fore.RED}❌ {site}: {data['error']}{Style.RESET_ALL}")
+        
+        return results
+
+    def measure_latency(self, host, port=80, timeout=3):
+        """Measure latency to a host"""
+        start = time.time()
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            result = sock.connect_ex((host, port))
+            sock.close()
+            if result == 0:
+                return (time.time() - start) * 1000
+        except:
+            pass
+        return float('inf')
+
+    # NEW: Real-time DNS Monitoring
+    def start_dns_monitoring(self, interval=30):
+        """Start real-time DNS monitoring"""
+        if self.monitoring_thread and self.monitoring_thread.is_alive():
+            print(f"{Fore.YELLOW}⚠️  DNS monitoring already running{Style.RESET_ALL}")
+            return
+        
+        self.monitoring_thread = threading.Thread(target=self._monitor_dns_loop, args=(interval,), daemon=True)
+        self.monitoring_thread.start()
+        print(f"{Fore.GREEN}🔄 DNS monitoring started (interval: {interval}s){Style.RESET_ALL}")
+
+    def stop_dns_monitoring(self):
+        """Stop real-time DNS monitoring"""
+        if self.monitoring_thread and self.monitoring_thread.is_alive():
+            self.is_running = False  # This will stop the monitoring loop
+            print(f"{Fore.YELLOW}🔄 DNS monitoring stopped{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.YELLOW}⚠️  DNS monitoring is not running{Style.RESET_ALL}")
+
+    def _monitor_dns_loop(self, interval):
+        """Internal monitoring loop"""
+        while self.is_running:
+            current = self.get_current_dns()
+            if current != self.last_dns_state:
+                timestamp = datetime.now().strftime('%H:%M:%S')
+                print(f"{Fore.YELLOW}🔄 DNS changed detected at {timestamp}{Style.RESET_ALL}")
+                print(f"{Fore.CYAN}Old: {self.last_dns_state[:100]}...{Style.RESET_ALL}")
+                print(f"{Fore.CYAN}New: {current[:100]}...{Style.RESET_ALL}")
+                self.last_dns_state = current
+            time.sleep(interval)
+
+    # NEW: Performance Analytics
+    def dns_performance_analysis(self, dns_configs):
+        """Analyze performance of different DNS configurations"""
+        print(f"{Fore.BLUE}📊 Running DNS performance analysis...{Style.RESET_ALL}")
+        
+        results = {}
+        for name, servers in dns_configs.items():
+            latencies = []
+            print(f"{Fore.CYAN}Testing {name}: {servers[0]}{Style.RESET_ALL}")
+            
+            for _ in range(5):  # Test 5 times for more accurate results
+                latency = self.measure_latency(servers[0])
+                if latency != float('inf'):
+                    latencies.append(latency)
+                time.sleep(0.2)  # Shorter delay for faster testing
+            
+            if latencies:
+                results[name] = {
+                    "avg_latency": statistics.mean(latencies),
+                    "min_latency": min(latencies),
+                    "max_latency": max(latencies),
+                    "stability": statistics.stdev(latencies) if len(latencies) > 1 else 0,
+                    "samples": len(latencies)
+                }
+        
+        # Sort by performance
+        sorted_results = sorted(results.items(), key=lambda x: x[1]["avg_latency"])
+        
+        print(f"\n{Fore.CYAN}🏆 DNS Performance Ranking:{Style.RESET_ALL}")
+        for i, (name, metrics) in enumerate(sorted_results, 1):
+            stability_color = Fore.BLUE if metrics['stability'] < 10 else Fore.RED
+            print(f"{Fore.YELLOW}{i}.{Style.RESET_ALL} {name}: "
+                  f"{Fore.GREEN}{metrics['avg_latency']:.2f}ms{Style.RESET_ALL} "
+                  f"(Stability: {stability_color}{metrics['stability']:.2f}ms{Style.RESET_ALL}, "
+                  f"Samples: {metrics['samples']})")
+        
+        self.performance_results = sorted_results
+        return sorted_results
+
+def get_optimized_dns_servers():
+    """Return only the best, fastest, and most secure DNS servers"""
+    return {
+        # 🌐 TOP GLOBAL SECURE DNS
+        "🔒 Cloudflare (Fast & Secure)": ["1.1.1.1", "1.0.0.1"],
+        "🔒 Cloudflare Security": ["1.1.1.2", "1.0.0.2"],  # Malware & Ad blocking
+        
+        # 🌐 TOP GLOBAL PERFORMANCE DNS
+        "🔍 Google (High Performance)": ["8.8.8.8", "8.8.4.4"],
+        "🔍 Google Security": ["8.8.4.4", "8.8.8.8"],  # Malware protection
+        
+        # 🌐 TOP SECURITY DNS
+        "🛡️  Quad9 (Security Focused)": ["9.9.9.9", "149.112.112.112"],
+        "🛡️  Quad9 + Malware": ["9.9.9.11", "149.112.112.11"],  # Enhanced security
+        
+        # 🌐 TOP PRIVACY DNS
+        "🔒 AdGuard DNS (Privacy)": ["94.140.14.14", "94.140.15.15"],
+        "🔒 AdGuard Family": ["94.140.14.15", "94.140.15.16"],  # With adult content blocking
+        
+        # 🌐 TOP RELIABLE DNS
+        "🔒 OpenDNS (Reliable)": ["208.67.222.222", "208.67.220.220"],
+        "🔒 OpenDNS Family": ["208.67.222.123", "208.67.220.123"],  # With content filtering
+        
+        # 🌐 TOP ALTERNATIVE DNS
+        "🔒 CleanBrowsing (Family)": ["185.228.168.168", "185.228.169.169"],
+        "🔒 FDN (French Privacy)": ["80.67.169.40", "80.67.169.12"],
+        
+        # 🌐 TOP FAST DNS
+        "🔍 Hurricane Electric": ["74.82.42.42", "74.82.42.43"],
+        "🔒 SafeDNS": ["195.46.39.39", "195.46.39.40"],
+    }
+
+def get_regional_optimized_dns():
+    """Return regional DNS optimized for different continents"""
+    return {
+        # 🌍 EUROPE
+        "🔒 Dutch Privacy DNS": ["185.228.168.9", "185.228.169.9"],
+        "🔒 German Privacy DNS": ["185.228.168.168", "185.228.169.169"],
+        "🔒 French DNS": ["80.67.169.12", "80.67.169.40"],
+        
+        # 🌍 ASIA-PACIFIC
+        "🔍 Alibaba DNS (China)": ["223.5.5.5", "223.6.6.6"],
+        "🔍 Japan DNS": ["133.242.1.21", "133.242.2.22"],
+        "🔍 Singapore DNS": ["165.21.100.88", "165.21.100.89"],
+        
+        # 🌍 NORTH AMERICA
+        "🔒 Canadian Privacy DNS": ["185.228.168.168", "185.228.169.169"],
+        "🔍 US Fast DNS": ["1.1.1.1", "1.0.0.1"],
+        
+        # 🌍 SOUTH AMERICA
+        "🔒 Brazilian DNS": ["200.165.207.24", "200.165.207.25"],
+        "🔍 Argentine DNS": ["200.64.128.10", "200.64.129.10"],
+        
+        # 🌍 AFRICA
+        "🔒 South African DNS": ["196.43.128.128", "196.43.129.129"],
+        "🔍 Nigerian DNS": ["196.201.192.10", "196.201.193.10"],
+        
+        # 🌍 MIDDLE EAST
+        "🔒 Iranian DNS": ["194.225.227.162", "194.225.227.163"],
+        "🔍 Saudi DNS": ["94.247.168.10", "94.247.169.10"],
+        
+        # 🌍 OCEANIA
+        "🔍 Australian DNS": ["1.0.0.1", "1.1.1.1"],
+        "🔒 New Zealand DNS": ["202.27.128.1", "202.27.129.1"],
+    }
+
+def print_header():
+    """Print a colorful header"""
+    print(f"{Fore.CYAN}{Style.BRIGHT}")
+    print("╔══════════════════════════════════════════════════════════════╗")
+    print("║              🌐 OPTIMIZED DNS CONTROLLER 🌐                ║")
+    print("║        🚀 Best, Fastest & Most Secure DNS Only             ║")
+    print("║         🔄 Auto-Restore System DNS on Exit                 ║")
+    print("║           📊 Advanced Testing & Performance                ║")
+    print("╚══════════════════════════════════════════════════════════════╝")
+    print(f"{Style.RESET_ALL}")
+
+def print_menu():
+    """Print the main menu"""
+    print(f"\n{Fore.MAGENTA}📋 MAIN MENU:{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}1.{Style.RESET_ALL} Change DNS Settings (Global Optimized)")
+    print(f"{Fore.CYAN}2.{Style.RESET_ALL} Change DNS Settings (Regional Optimized)")
+    print(f"{Fore.CYAN}3.{Style.RESET_ALL} Test Current DNS")
+    print(f"{Fore.CYAN}4.{Style.RESET_ALL} Advanced DNS Testing")
+    print(f"{Fore.CYAN}5.{Style.RESET_ALL} DNS Performance Analysis")
+    print(f"{Fore.CYAN}6.{Style.RESET_ALL} Start DNS Monitoring")
+    print(f"{Fore.CYAN}7.{Style.RESET_ALL} Stop DNS Monitoring")
+    print(f"{Fore.CYAN}8.{Style.RESET_ALL} Flush DNS Cache")
+    print(f"{Fore.CYAN}9.{Style.RESET_ALL} Show Status")
+    print(f"{Fore.CYAN}10.{Style.RESET_ALL} Reset to Original DNS")
+    print(f"{Fore.CYAN}11.{Style.RESET_ALL} Exit Program")
+    print(f"\n{Fore.YELLOW}💡 Press Ctrl+C at any time to exit safely{Style.RESET_ALL}")
+
+def main():
+    print_header()
+    
+    controller = DNSController()
+    
+    while controller.is_running:
+        try:
+            controller.show_status()
+            print_menu()
+            
+            choice = input(f"\n{Fore.YELLOW}Enter your choice (1-11): {Style.RESET_ALL}").strip()
+            
+            if choice == "1":
+                # Change DNS with Global Optimized
+                dns_options = get_optimized_dns_servers()
+                print(f"\n{Fore.MAGENTA}🚀 Global Optimized DNS Options (Best, Fastest, Most Secure):{Style.RESET_ALL}")
+                for i, (name, servers) in enumerate(dns_options.items(), 1):
+                    print(f"{Fore.CYAN}{i}.{Style.RESET_ALL} {name}: {Fore.GREEN}{servers[0]}{Style.RESET_ALL}, {Fore.GREEN}{servers[1]}{Style.RESET_ALL}")
+                
+                try:
+                    dns_choice = int(input(f"\n{Fore.YELLOW}Choose DNS provider (1-{len(dns_options)}): {Style.RESET_ALL}")) - 1
+                    if 0 <= dns_choice < len(dns_options):
+                        dns_name = list(dns_options.keys())[dns_choice]
+                        dns_servers = list(dns_options.values())[dns_choice]
+                        print(f"\n{Fore.CYAN}🔄 Changing DNS to {dns_name}: {dns_servers}{Style.RESET_ALL}")
+                        
+                        if controller.change_dns(dns_servers):
+                            print(f"\n{Fore.BLUE}🧹 Flushing DNS cache...{Style.RESET_ALL}")
+                            controller.flush_dns_cache()
+                            
+                            print(f"\n{Fore.BLUE}🧪 Testing new DNS settings...{Style.RESET_ALL}")
+                            time.sleep(2)
+                            controller.test_dns_resolution()
+                            controller.test_internet_access()
+                        else:
+                            print(f"{Fore.RED}❌ Failed to change DNS settings{Style.RESET_ALL}")
+                    else:
+                        print(f"{Fore.RED}❌ Invalid choice{Style.RESET_ALL}")
+                except ValueError:
+                    print(f"{Fore.RED}❌ Invalid input{Style.RESET_ALL}")
+            
+            elif choice == "2":
+                # Change DNS with Regional Optimized
+                dns_options = get_regional_optimized_dns()
+                print(f"\n{Fore.MAGENTA}🌍 Regional Optimized DNS Options:{Style.RESET_ALL}")
+                for i, (name, servers) in enumerate(dns_options.items(), 1):
+                    print(f"{Fore.CYAN}{i}.{Style.RESET_ALL} {name}: {Fore.GREEN}{servers[0]}{Style.RESET_ALL}, {Fore.GREEN}{servers[1]}{Style.RESET_ALL}")
+                
+                try:
+                    dns_choice = int(input(f"\n{Fore.YELLOW}Choose DNS provider (1-{len(dns_options)}): {Style.RESET_ALL}")) - 1
+                    if 0 <= dns_choice < len(dns_options):
+                        dns_name = list(dns_options.keys())[dns_choice]
+                        dns_servers = list(dns_options.values())[dns_choice]
+                        print(f"\n{Fore.CYAN}🔄 Changing DNS to {dns_name}: {dns_servers}{Style.RESET_ALL}")
+                        
+                        if controller.change_dns(dns_servers):
+                            print(f"\n{Fore.BLUE}🧹 Flushing DNS cache...{Style.RESET_ALL}")
+                            controller.flush_dns_cache()
+                            
+                            print(f"\n{Fore.BLUE}🧪 Testing new DNS settings...{Style.RESET_ALL}")
+                            time.sleep(2)
+                            controller.test_dns_resolution()
+                            controller.test_internet_access()
+                        else:
+                            print(f"{Fore.RED}❌ Failed to change DNS settings{Style.RESET_ALL}")
+                    else:
+                        print(f"{Fore.RED}❌ Invalid choice{Style.RESET_ALL}")
+                except ValueError:
+                    print(f"{Fore.RED}❌ Invalid input{Style.RESET_ALL}")
+            
+            elif choice == "3":
+                # Test DNS
+                print(f"\n{Fore.BLUE}🔍 Testing current DNS...{Style.RESET_ALL}")
+                controller.test_dns_resolution()
+                controller.test_internet_access()
+            
+            elif choice == "4":
+                # Advanced DNS Testing
+                print(f"\n{Fore.BLUE}🔍 Running advanced DNS testing...{Style.RESET_ALL}")
+                controller.advanced_dns_test()
+            
+            elif choice == "5":
+                # DNS Performance Analysis
+                dns_configs = get_optimized_dns_servers()
+                controller.dns_performance_analysis(dns_configs)
+            
+            elif choice == "6":
+                # Start DNS Monitoring
+                interval = input(f"{Fore.YELLOW}Enter monitoring interval in seconds (default 30): {Style.RESET_ALL}") or "30"
+                try:
+                    interval = int(interval)
+                    controller.start_dns_monitoring(interval)
+                except ValueError:
+                    print(f"{Fore.RED}❌ Invalid interval{Style.RESET_ALL}")
+            
+            elif choice == "7":
+                # Stop DNS Monitoring
+                controller.stop_dns_monitoring()
+            
+            elif choice == "8":
+                # Flush DNS cache
+                controller.flush_dns_cache()
+            
+            elif choice == "9":
+                # Show status
+                controller.show_status()
+            
+            elif choice == "10":
+                # Reset to original DNS
+                controller.reset_dns()
+            
+            elif choice == "11":
+                # Exit
+                print(f"{Fore.GREEN}👋 Exiting DNS Controller. Restoring original settings...{Style.RESET_ALL}")
+                break
+            
+            else:
+                print(f"{Fore.RED}❌ Invalid choice. Please enter 1-11.{Style.RESET_ALL}")
+            
+            input(f"\n{Fore.CYAN}Press Enter to continue...{Style.RESET_ALL}")
+        
+        except KeyboardInterrupt:
+            print(f"\n{Fore.YELLOW}⚠️  Received interrupt signal, exiting safely...{Style.RESET_ALL}")
+            break
+        except Exception as e:
+            print(f"{Fore.RED}❌ An error occurred: {e}{Style.RESET_ALL}")
+
+if __name__ == "__main__":
+    main()
