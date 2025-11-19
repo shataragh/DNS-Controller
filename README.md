@@ -67,7 +67,7 @@ DNS Controller is a comprehensive Python-based tool designed to optimize DNS res
 ### Setup
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/dns-controller.git
+git clone https://github.com/shataragh/dns-controller.git
 cd dns-controller
 
 # Install dependencies
